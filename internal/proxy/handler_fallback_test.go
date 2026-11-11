@@ -846,3 +846,64 @@ func TestHandler_ThoughtSignature400_AutoSanitizeRecovery(t *testing.T) {
 		t.Errorf("expected exactly 2 calls (initial 400 + retry 200), got %d", callCount)
 	}
 }
+
+func TestClientModelPreservedAcrossAccountRotation(t *testing.T) {
+	env := newFallbackTestEnv(t, "gemini-2.5-pro", "gemini-2.5-flash", false)
+	now := time.Now().UTC()
+	for i := 1; i <= 2; i++ {
+		acc := &domain.Account{ID: fmt.Sprintf("client-model-%d", i), Email: fmt.Sprintf("model%d@example.com", i), AccessToken: fmt.Sprintf("client-token-%d", i), IsActive: i == 1, Status: domain.AccountStatusActive, CreatedAt: now.Add(time.Duration(i) * time.Second), UpdatedAt: now}
+		if err := env.accountRepo.Create(context.Background(), acc); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.mockGoogle.SetFailoverTrigger("client-token-1", 1)
+	path := "/v1internal/models/claude-3-7-sonnet:streamGenerateContent"
+	query := "alt=sse&model=claude-3-7-sonnet"
+	body := `{"model":"claude-3-7-sonnet","contents":[{"parts":[{"text":"hello"}]}]}`
+	resp, err := env.client.Post(env.server.URL+path+"?"+query, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	requests := env.mockGoogle.GetRecordedRequests()
+	if len(requests) != 2 {
+		t.Fatalf("got %d requests, want 2", len(requests))
+	}
+	for i, req := range requests {
+		if req.Path != path || req.RawQuery != query || string(req.Body) != body {
+			t.Errorf("request %d changed client request: path=%q query=%q body=%s", i, req.Path, req.RawQuery, req.Body)
+		}
+		if want := fmt.Sprintf("client-token-%d", i+1); req.AuthBearer != want {
+			t.Errorf("request %d token=%q want %q", i, req.AuthBearer, want)
+		}
+	}
+}
+
+func TestClientModelPreservedWithFallbackEnabled(t *testing.T) {
+	env := newFallbackTestEnv(t, "gemini-2.5-pro", "gemini-2.5-flash", true)
+	now := time.Now().UTC()
+	acc := &domain.Account{ID: "enabled-model", Email: "enabled@example.com", AccessToken: "enabled-token", IsActive: true, Status: domain.AccountStatusActive, CreatedAt: now, UpdatedAt: now}
+	if err := env.accountRepo.Create(context.Background(), acc); err != nil {
+		t.Fatal(err)
+	}
+	path := "/v1internal/models/claude-3-7-sonnet:streamGenerateContent"
+	body := `{"model":"claude-3-7-sonnet","contents":[]}`
+	resp, err := env.client.Post(env.server.URL+path, "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status: %d", resp.StatusCode)
+	}
+	reqs := env.mockGoogle.GetRecordedRequests()
+	if len(reqs) != 1 {
+		t.Fatalf("got %d requests", len(reqs))
+	}
+	if reqs[0].Path != path || string(reqs[0].Body) != body {
+		t.Errorf("client model changed: path=%q body=%s", reqs[0].Path, reqs[0].Body)
+	}
+}
